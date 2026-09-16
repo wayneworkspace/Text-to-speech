@@ -1,2 +1,4 @@
 openai-whisper
 python-dotenv
+pyannote.audio
+anthropic

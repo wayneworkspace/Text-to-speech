@@ -23,6 +23,8 @@ from config import CONFIG, OUTPUT_DIR
 from pipeline.utils import check_ffmpeg_available
 from pipeline.extract import probe_media_info, extract_audio
 from pipeline.transform import load_whisper_model, transform_to_segments
+from pipeline.diarize import diarize_audio, assign_speakers
+from pipeline.enrich import segment_topics
 from pipeline.load import write_markdown
 from pipeline.gui import App
 
@@ -54,11 +56,25 @@ def run_pipeline(video_path: str, log) -> str:
             audio_path, info["duration"], CONFIG, model, log, tmp_dir
         )
 
+        # Speaker diarization (pipeline/diarize.py) - optional, needs HUGGINGFACE_TOKEN.
+        if CONFIG["huggingface_token"]:
+            turns = diarize_audio(audio_path, CONFIG["huggingface_token"], log)
+            segments = assign_speakers(segments, turns)
+        else:
+            log("No HUGGINGFACE_TOKEN set - skipping speaker diarization.")
+
+        # Topic segmentation (pipeline/enrich.py) - optional, needs ANTHROPIC_API_KEY.
+        if CONFIG["anthropic_api_key"]:
+            topics = segment_topics(segments, CONFIG["anthropic_api_key"], CONFIG["anthropic_model"], log)
+        else:
+            log("No ANTHROPIC_API_KEY set - skipping topic segmentation.")
+            topics = []
+
         # ------------------------------------------------------------------
         # LOAD: write the result to a Markdown file in output/ (pipeline/load.py)
         # ------------------------------------------------------------------
         log("Writing Markdown file...")
-        output_path = write_markdown(OUTPUT_DIR, video_path, segments)
+        output_path = write_markdown(OUTPUT_DIR, video_path, segments, topics)
         log(f"Done! Result: {output_path}")
         return output_path
 

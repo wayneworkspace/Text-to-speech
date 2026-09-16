@@ -65,4 +65,24 @@ CONFIG = {
 
     # Keep temporary audio files (audio.wav, chunk_*.wav) around for debugging.
     "keep_temp_files": _get_bool("KEEP_TEMP_FILES", False),
+
+    # Optional hint fed to Whisper (as `initial_prompt`) so it recognizes
+    # domain-specific terms, names, or jargon correctly. Leave empty to skip.
+    "domain_vocabulary": _get_optional_str("DOMAIN_VOCABULARY", None),
+
+    # Whisper's own confidence score (avg_logprob) for each segment. Segments
+    # scoring below this threshold are flagged in the output as low-confidence,
+    # so the user knows which lines are worth double-checking.
+    "confidence_threshold": _get_float("CONFIDENCE_THRESHOLD", -1.0),
+
+    # HuggingFace access token, required to download the pyannote speaker
+    # diarization model (see README.md - "Getting a HuggingFace token").
+    # Leave empty to skip speaker diarization entirely.
+    "huggingface_token": _get_optional_str("HUGGINGFACE_TOKEN", None),
+
+    # Anthropic API key + model, used for topic/semantic segmentation
+    # (see README.md - "Getting an Anthropic API key"). Leave the key empty
+    # to skip topic segmentation entirely.
+    "anthropic_api_key": _get_optional_str("ANTHROPIC_API_KEY", None),
+    "anthropic_model": _get_str("ANTHROPIC_MODEL", "claude-sonnet-5"),
 }

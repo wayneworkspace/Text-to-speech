@@ -87,9 +87,19 @@ def load_whisper_model(model_size: str, log):
     return model
 
 
-def transcribe_chunk(model, chunk_path: str, language) -> list:
-    """Transcribe one chunk, returning a list of segments (start/end/text relative to 0)."""
-    result = model.transcribe(chunk_path, language=language, verbose=False)
+def transcribe_chunk(model, chunk_path: str, language, initial_prompt) -> list:
+    """
+    Transcribe one chunk, returning Whisper's raw segments (start/end/text/
+    avg_logprob/... relative to 0). `initial_prompt` is an optional domain
+    vocabulary hint (see config.py's DOMAIN_VOCABULARY) that nudges Whisper
+    toward correctly spelling technical terms, names, or jargon.
+    """
+    result = model.transcribe(
+        chunk_path,
+        language=language,
+        initial_prompt=initial_prompt,
+        verbose=False,
+    )
     return result.get("segments", [])
 
 
@@ -122,12 +132,18 @@ def transform_to_segments(audio_path: str, duration: float, config: dict, model,
         chunk_path = os.path.join(tmp_dir, f"chunk_{idx:03d}.wav")
         cut_chunk(audio_path, start, end, chunk_path)
 
-        segments = transcribe_chunk(model, chunk_path, config["language"])
+        segments = transcribe_chunk(
+            model, chunk_path, config["language"], config["domain_vocabulary"]
+        )
         for seg in segments:
             all_segments.append({
                 "start": seg["start"] + start,
                 "end": seg["end"] + start,
                 "text": seg["text"],
+                # Whisper's own confidence score for this segment; flag it if
+                # it falls below the configured threshold so the user knows
+                # which lines are worth double-checking.
+                "low_confidence": seg.get("avg_logprob", 0.0) < config["confidence_threshold"],
             })
         log(f"[{idx}/{len(chunks)}] Done ({len(segments)} sentence(s)).")
 
