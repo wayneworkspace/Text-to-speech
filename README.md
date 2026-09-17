@@ -2,14 +2,8 @@
 
 A local pipeline that turns the spoken content of `.mp4` videos into timestamped Markdown transcripts, using FFmpeg for audio processing and a local Whisper model for speech recognition.
 
-<<<<<<< HEAD
 Techstack
 Python | FFmpeg | OpenAI Whisper | pyannote.audio | Anthropic API | Tkinter | python-dotenv
-=======
-**Techstack:**
-
-Python | FFmpeg | OpenAI Whisper | Tkinter | python-dotenv
->>>>>>> ebbaf3b4b2387dd210cea749a22371680b46cc5c
 
 ## Overview
 
