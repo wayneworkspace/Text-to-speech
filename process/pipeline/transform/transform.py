@@ -8,10 +8,21 @@ import os
 import re
 import subprocess
 
-from .utils import FFMPEG_BIN, format_timestamp
+from ..utils import FFMPEG_BIN, format_timestamp
 
 _SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
 _SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
+
+# Same reasoning as extract.py - generous timeouts, just to fail loudly
+# instead of hanging forever on a corrupt/unusual input.
+_SILENCE_DETECT_TIMEOUT_SECONDS = 3600
+_CUT_CHUNK_TIMEOUT_SECONDS = 120
+
+# Whisper models already loaded this session, keyed by model_size, so
+# switching between videos in the same GUI run does not reload (and
+# re-download-check) a multi-GB model every single time. See
+# CODE_REVIEW.md, section 3, for why this mattered.
+_LOADED_MODELS = {}
 
 
 def detect_silences(audio_path: str, noise_db: float, min_dur: float) -> list:
@@ -21,7 +32,12 @@ def detect_silences(audio_path: str, noise_db: float, min_dur: float) -> list:
         "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
         "-f", "null", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_SILENCE_DETECT_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Silence detection did not finish within {_SILENCE_DETECT_TIMEOUT_SECONDS}s.")
     starts = [float(m.group(1)) for m in _SILENCE_START_RE.finditer(result.stderr)]
     ends = [float(m.group(1)) for m in _SILENCE_END_RE.finditer(result.stderr)]
     return list(zip(starts, ends[: len(starts)]))
@@ -63,7 +79,7 @@ def plan_chunks(duration: float, silences: list, target: int, min_len: int, max_
 
 
 def cut_chunk(audio_path: str, start: float, end: float, out_path: str):
-    """Cut one [start, end) audio segment into its own file (stream copy - fast & exact since it's PCM)."""
+    """Cut one [start, end) audio segment into its own file (stream copy - fast & exact since it is PCM)."""
     duration = max(0.05, end - start)
     cmd = [
         FFMPEG_BIN, "-y",
@@ -73,17 +89,35 @@ def cut_chunk(audio_path: str, start: float, end: float, out_path: str):
         "-c", "copy",
         out_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_CUT_CHUNK_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Cutting audio chunk did not finish within {_CUT_CHUNK_TIMEOUT_SECONDS}s.")
     if result.returncode != 0:
         raise RuntimeError(f"Cutting audio chunk failed:\n{result.stderr[-2000:]}")
 
 
 def load_whisper_model(model_size: str, log):
-    """Load the Whisper model (runs locally/offline). Imported lazily so the GUI appears instantly."""
-    log(f"Loading Whisper model '{model_size}' (first run may take a few minutes to download)...")
+    """
+    Load the Whisper model (runs locally/offline), reusing an already-loaded
+    model of the same size instead of reloading it from disk every time this
+    is called - matters when processing several videos in one GUI session.
+    Imported lazily so the GUI appears instantly.
+    """
+    if model_size in _LOADED_MODELS:
+        log(f"Reusing already-loaded Whisper model '{model_size}'.")
+        return _LOADED_MODELS[model_size]
+
+    import torch
     import whisper
-    model = whisper.load_model(model_size)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log(f"Using device: {device}")
+    log(f"Loading Whisper model '{model_size}' (first run may take a few minutes to download)...")
+    model = whisper.load_model(model_size, device=device)
     log("Model loaded.")
+
+    _LOADED_MODELS[model_size] = model
     return model
 
 
@@ -94,10 +128,15 @@ def transcribe_chunk(model, chunk_path: str, language, initial_prompt) -> list:
     vocabulary hint (see config.py's DOMAIN_VOCABULARY) that nudges Whisper
     toward correctly spelling technical terms, names, or jargon.
     """
+    # fp16 only makes sense (and is only supported) on a CUDA GPU; on CPU,
+    # asking for it just makes Whisper silently fall back to fp32 with a
+    # warning printed on every single chunk. Decide it explicitly instead.
+    use_fp16 = next(model.parameters()).device.type == "cuda"
     result = model.transcribe(
         chunk_path,
         language=language,
         initial_prompt=initial_prompt,
+        fp16=use_fp16,
         verbose=False,
     )
     return result.get("segments", [])

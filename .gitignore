@@ -1,0 +1,16 @@
+# Secrets / local config
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime output & local data (not meant to be shared via git)
+output/
+data/speaker_profiles.json
+
+# process/batch.py runtime state (per-video progress table + lock file)
+# and its logs - machine-local, regenerated automatically, not meant to
+# be shared via git.
+state/
+logs/

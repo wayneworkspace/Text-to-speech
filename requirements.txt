@@ -2,3 +2,5 @@ openai-whisper
 python-dotenv
 pyannote.audio
 anthropic
+numpy
+psutil

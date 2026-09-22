@@ -7,7 +7,7 @@ added later without touching EXTRACT/TRANSFORM.
 import os
 from datetime import datetime
 
-from .utils import format_timestamp
+from ..utils import format_timestamp
 
 
 def build_output_filename(video_path: str) -> str:
