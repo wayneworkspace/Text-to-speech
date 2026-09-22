@@ -4,7 +4,7 @@ A local pipeline that turns the spoken content of `.mp4` videos into timestamped
 
 **Techstack:**
 
-Python | FFmpeg | OpenAI Whisper | Tkinter | python-dotenv
+Python | FFmpeg | OpenAI Whisper | pyannote.audio | Anthropic API | Tkinter | python-dotenv
 
 ## Overview
 
