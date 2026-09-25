@@ -32,19 +32,19 @@ import time
 from datetime import datetime
 
 from config import CONFIG
-from pipeline.utils import check_ffmpeg_available
+from main import run_pipeline
 from pipeline.batch_state import (
     acquire_lock,
-    release_lock,
     load_state,
-    save_state,
-    recover_interrupted,
-    mark_running,
     mark_done,
     mark_failed,
+    mark_running,
+    recover_interrupted,
+    release_lock,
+    save_state,
     should_process,
 )
-from main import run_pipeline
+from pipeline.utils import check_ffmpeg_available
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm")
 

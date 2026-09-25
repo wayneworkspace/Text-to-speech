@@ -12,11 +12,10 @@ Usage:
 """
 import os
 import sys
-import tempfile
 
-from pipeline.utils import check_ffmpeg_available
-from pipeline.extract.extract import probe_media_info, extract_audio
 from config import CONFIG, RAW_AUDIO_DIR
+from pipeline.extract.extract import extract_audio, probe_media_info
+from pipeline.utils import check_ffmpeg_available
 
 
 def main():

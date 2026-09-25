@@ -23,7 +23,6 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import numpy as np
-
 from pipeline.enrich import speaker_id
 
 
@@ -564,11 +563,10 @@ class TestEnrollSpeaker(unittest.TestCase):
         inference = MagicMock()
         inference.crop.side_effect = RuntimeError("decode failed")
 
-        with _sys_modules_patch(inference):
-            with self.assertRaises(RuntimeError):
-                speaker_id.enroll_speaker(
-                    "Wayne", "audio.wav", [(0.0, 3.0)], "hf_token", self.path, _silent_log,
-                )
+        with _sys_modules_patch(inference), self.assertRaises(RuntimeError):
+            speaker_id.enroll_speaker(
+                "Wayne", "audio.wav", [(0.0, 3.0)], "hf_token", self.path, _silent_log,
+            )
 
 
 if __name__ == "__main__":

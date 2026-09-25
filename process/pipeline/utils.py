@@ -68,8 +68,8 @@ def load_waveform(audio_path: str) -> dict:
     9.11-9.14, for the full history (including a torchaudio.load() fix
     attempt that turned out not to work) before changing this again.
     """
-    import torch
     import soundfile as sf
+    import torch
 
     # always_2d keeps shape (samples, channels) even for mono; .T gives the
     # (channels, samples) layout torch audio tensors use.

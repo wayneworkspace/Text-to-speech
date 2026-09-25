@@ -125,9 +125,8 @@ def _tmpdir_tracker():
 class TestStageCallOrder(unittest.TestCase):
     def test_full_order_with_both_api_keys_set(self):
         order = []
-        with mock.patch.dict(main.CONFIG, {"huggingface_token": "hf_token", "anthropic_api_key": "sk-ant"}):
-            with _patched_stages(order=order):
-                main.run_pipeline("video.mp4", _noop_log)
+        with mock.patch.dict(main.CONFIG, {"huggingface_token": "hf_token", "anthropic_api_key": "sk-ant"}), _patched_stages(order=order):
+            main.run_pipeline("video.mp4", _noop_log)
 
         self.assertEqual(
             order,
@@ -150,7 +149,7 @@ class TestStageCallOrder(unittest.TestCase):
         )
 
     def test_return_value_is_write_markdowns_return_value(self):
-        with _patched_stages() as mocks:
+        with _patched_stages():
             result = main.run_pipeline("video.mp4", _noop_log)
 
         self.assertEqual(result, _DEFAULT_RETURNS["write_markdown"])
@@ -167,17 +166,15 @@ class TestHuggingfaceTokenGating(unittest.TestCase):
     )
 
     def test_diarization_skipped_when_no_token(self):
-        with mock.patch.dict(main.CONFIG, {"huggingface_token": None}):
-            with _patched_stages() as mocks:
-                main.run_pipeline("video.mp4", _noop_log)
+        with mock.patch.dict(main.CONFIG, {"huggingface_token": None}), _patched_stages() as mocks:
+            main.run_pipeline("video.mp4", _noop_log)
 
         for name in self._DIARIZATION_STAGES:
             mocks[name].assert_not_called()
 
     def test_diarization_run_when_token_set(self):
-        with mock.patch.dict(main.CONFIG, {"huggingface_token": "hf_token"}):
-            with _patched_stages() as mocks:
-                main.run_pipeline("video.mp4", _noop_log)
+        with mock.patch.dict(main.CONFIG, {"huggingface_token": "hf_token"}), _patched_stages() as mocks:
+            main.run_pipeline("video.mp4", _noop_log)
 
         for name in self._DIARIZATION_STAGES:
             mocks[name].assert_called_once()
@@ -189,9 +186,8 @@ class TestHuggingfaceTokenGating(unittest.TestCase):
         # the try/except added around this block in main.py actually
         # protects the rest of the run - later stages still run and
         # run_pipeline() returns normally instead of raising.
-        with mock.patch.dict(main.CONFIG, {"huggingface_token": "hf_token"}):
-            with _patched_stages(overrides={"diarize_audio": RuntimeError("pyannote boom")}) as mocks:
-                result = main.run_pipeline("video.mp4", _noop_log)
+        with mock.patch.dict(main.CONFIG, {"huggingface_token": "hf_token"}), _patched_stages(overrides={"diarize_audio": RuntimeError("pyannote boom")}) as mocks:
+            result = main.run_pipeline("video.mp4", _noop_log)
 
         mocks["assign_speakers"].assert_not_called()
         mocks["load_profiles"].assert_not_called()
@@ -201,9 +197,8 @@ class TestHuggingfaceTokenGating(unittest.TestCase):
 
 class TestAnthropicApiKeyGating(unittest.TestCase):
     def test_correction_and_topics_skipped_when_no_key(self):
-        with mock.patch.dict(main.CONFIG, {"anthropic_api_key": None}):
-            with _patched_stages() as mocks:
-                main.run_pipeline("video.mp4", _noop_log)
+        with mock.patch.dict(main.CONFIG, {"anthropic_api_key": None}), _patched_stages() as mocks:
+            main.run_pipeline("video.mp4", _noop_log)
 
         mocks["correct_transcript_errors"].assert_not_called()
         mocks["segment_topics"].assert_not_called()
@@ -212,9 +207,8 @@ class TestAnthropicApiKeyGating(unittest.TestCase):
         self.assertEqual(write_markdown_args[3], [])
 
     def test_correction_and_topics_run_when_key_set(self):
-        with mock.patch.dict(main.CONFIG, {"anthropic_api_key": "sk-ant"}):
-            with _patched_stages() as mocks:
-                main.run_pipeline("video.mp4", _noop_log)
+        with mock.patch.dict(main.CONFIG, {"anthropic_api_key": "sk-ant"}), _patched_stages() as mocks:
+            main.run_pipeline("video.mp4", _noop_log)
 
         mocks["correct_transcript_errors"].assert_called_once()
         mocks["segment_topics"].assert_called_once()
@@ -223,10 +217,12 @@ class TestAnthropicApiKeyGating(unittest.TestCase):
 class TestTempDirCleanup(unittest.TestCase):
     def test_tmp_dir_removed_on_success(self):
         created, fake_mkdtemp = _tmpdir_tracker()
-        with mock.patch.dict(main.CONFIG, {"keep_temp_files": False}):
-            with mock.patch("main.tempfile.mkdtemp", side_effect=fake_mkdtemp):
-                with _patched_stages():
-                    main.run_pipeline("video.mp4", _noop_log)
+        with (
+            mock.patch.dict(main.CONFIG, {"keep_temp_files": False}),
+            mock.patch("main.tempfile.mkdtemp", side_effect=fake_mkdtemp),
+            _patched_stages(),
+        ):
+            main.run_pipeline("video.mp4", _noop_log)
 
         self.assertEqual(len(created), 1)
         self.assertFalse(os.path.exists(created[0]))
@@ -234,10 +230,12 @@ class TestTempDirCleanup(unittest.TestCase):
     def test_tmp_dir_kept_when_keep_temp_files_true(self):
         created, fake_mkdtemp = _tmpdir_tracker()
         try:
-            with mock.patch.dict(main.CONFIG, {"keep_temp_files": True}):
-                with mock.patch("main.tempfile.mkdtemp", side_effect=fake_mkdtemp):
-                    with _patched_stages():
-                        main.run_pipeline("video.mp4", _noop_log)
+            with (
+                mock.patch.dict(main.CONFIG, {"keep_temp_files": True}),
+                mock.patch("main.tempfile.mkdtemp", side_effect=fake_mkdtemp),
+                _patched_stages(),
+            ):
+                main.run_pipeline("video.mp4", _noop_log)
 
             self.assertEqual(len(created), 1)
             self.assertTrue(os.path.exists(created[0]))
@@ -254,11 +252,13 @@ class TestTempDirCleanup(unittest.TestCase):
         # must not be swallowed - the exception has to reach the caller.
         created, fake_mkdtemp = _tmpdir_tracker()
         boom = RuntimeError("transcription blew up")
-        with mock.patch.dict(main.CONFIG, {"keep_temp_files": False}):
-            with mock.patch("main.tempfile.mkdtemp", side_effect=fake_mkdtemp):
-                with _patched_stages(overrides={"transform_to_segments": boom}) as mocks:
-                    with self.assertRaises(RuntimeError) as ctx:
-                        main.run_pipeline("video.mp4", _noop_log)
+        with (
+            mock.patch.dict(main.CONFIG, {"keep_temp_files": False}),
+            mock.patch("main.tempfile.mkdtemp", side_effect=fake_mkdtemp),
+            _patched_stages(overrides={"transform_to_segments": boom}) as mocks,
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            main.run_pipeline("video.mp4", _noop_log)
 
         self.assertIs(ctx.exception, boom)
         self.assertEqual(len(created), 1)
