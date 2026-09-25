@@ -356,3 +356,170 @@ Các test khác cũng thêm trong vòng này:
 - `test_batch_helpers.py` (16 test) - các hàm thuần tuý của `batch.py` chưa từng có test: `find_video_files` (quét đệ quy + lọc đúng đuôi file), `is_file_stable` (phát hiện file đang copy dở qua 2 lần đo size), `clean_orphaned_temp_dirs` (dọn thư mục tạm `video2text_*`/`enroll_*` sót lại từ lần chạy bị crash - cùng tinh thần khôi phục sau crash ở mục 9.1, nhưng cho file tạm thay vì `batch_state.json`), `make_file_logger` (ghi log có timestamp ra nhiều file đích cùng lúc).
 
 Tổng: 72 test cũ + 46 test mới = **118 test**, chạy `python tests/run_all.py -v` thật, **118/118 pass**.
+
+### 9.6 `output/` tách thành `raw/` và `processed/` - audio thô không còn là file tạm bị xoá
+
+Theo yêu cầu của bạn sau khi test thật `try_extract.py` trên video dài 2 tiếng (`DA_Buổi_1.mp4`, 7162.3s - xác nhận đúng nhánh trích xuất song song theo chunk hoạt động chính xác, duration khớp tuyệt đối): `output/raw/` lưu audio thô EXTRACT tách ra (`<tên_video>.wav`), `output/processed/` lưu transcript Markdown cuối cùng - đúng tinh thần "raw vs processed" của ETL mà project này đã theo từ đầu.
+
+Trước đây `audio.wav` chỉ là file tạm trong `tempfile.mkdtemp()`, bị xoá ngay sau mỗi lần chạy (trừ khi `KEEP_TEMP_FILES=true`) - nghĩa là muốn chạy lại TRANSFORM/ENRICH trên cùng 1 video (đổi `MODEL_SIZE`, thử lại diarization...) phải giải mã lại từ đầu video gốc. Giờ `RAW_AUDIO_DIR`/`PROCESSED_DIR` (`config.py`) thay cho `OUTPUT_DIR` cũ; `main.py` lưu audio vào `output/raw/<tên_video>.wav` - **ghi đè theo tên video, không theo ngày** (khác với transcript Markdown vẫn ghi đè theo ngày như cũ) - vì audio trích ra từ cùng 1 video luôn giống hệt nhau bất kể chạy lúc nào, đánh dấu ngày ở đây chỉ tổ chiếm ổ cứng vô ích với file có thể vài trăm MB (video test 2 tiếng ra file 218MB). File `chunk_*.wav` của Whisper (TRANSFORM) vẫn là file tạm bị xoá như cũ, không đổi.
+
+`extract_audio()` (`pipeline/extract/extract.py`) được thêm `os.makedirs(os.path.dirname(audio_path), exist_ok=True)` ở đầu hàm - tự tạo thư mục đích nếu chưa có (phòng trường hợp clone project mới chưa có sẵn `output/raw/`), không phụ thuộc caller phải tự tạo trước.
+
+Đã test lại: `try_extract.py` chạy thật lần 2 trên đúng video 2 tiếng đó, xác nhận file ra đúng `output/raw/DA_Buổi_1.wav` (229,192,438 byte, khớp lại với duration gốc, diff 0.0s). Toàn bộ 118 test cũ vẫn pass nguyên (không có test nào phụ thuộc vào `OUTPUT_DIR` cũ theo tên - `test_load.py` luôn truyền `output_dir` riêng qua tham số, `test_run_pipeline.py` mock toàn bộ `extract_audio`/`write_markdown` nên không chạm filesystem thật).
+
+### 9.7 2 lỗi thật tìm thấy khi chạy trên máy bạn — sửa + test lại (137 test)
+
+Bạn chạy `try_pipeline.py` thật trên đoạn clip 3 phút (`.env` đã điền `HUGGINGFACE_TOKEN` + `ANTHROPIC_API_KEY`) và phát hiện 2 lỗi thật mà toàn bộ 118 test trước đó không bắt được:
+
+**Lỗi 1 - `TypeError: 'ThinkingBlock' object has no attribute 'text'`** (transcript correction) — `correct.py`/`enrich.py` đều giả định `response.content[0]` luôn là block text, nhưng khi Claude dùng "extended thinking", block đầu tiên là `ThinkingBlock` (không có `.text`). `correct.py` tự bắt được lỗi này (có try/except, log "skipped") nên không crash - nhưng đây vẫn là 1 bug thật cần sửa vì mọi lần gọi Claude sau này (khi bật thinking) sẽ luôn bị skip. `enrich.py` có **y hệt lỗi** nhưng chưa kịp lộ ra do pipeline đã crash trước đó ở lỗi 2.
+
+Sửa: thêm `extract_text_from_anthropic_response()` vào `pipeline/utils.py` - duyệt qua toàn bộ `response.content`, chỉ lấy các block có `type == "text"`, bỏ qua block khác (thinking, v.v.) thay vì giả định vị trí `[0]`. Cả `correct.py` và `enrich.py` dùng chung hàm này.
+
+**Lỗi 2 - `TypeError: Pipeline.from_pretrained() got an unexpected keyword argument 'use_auth_token'`** (diarization) — pyannote.audio bản mới trên máy bạn đã đổi tên tham số `use_auth_token` thành `token` (theo huggingface_hub). Nghiêm trọng hơn: **`main.py` không hề bọc try/except quanh khối diarization** như đã làm với correction/topic segmentation - nên lỗi này làm sập toàn bộ pipeline, **mất luôn 5 phút Whisper vừa transcribe xong** (đúng như bạn gặp thật). Đây là chỗ code không nhất quán với chính triết lý "never crash pipeline" đã áp dụng cho các bước tuỳ chọn khác trong project.
+
+Sửa 2 phần:
+- `diarize.py`: `Pipeline.from_pretrained()` thử `token=` trước (bản pyannote.audio hiện tại), nếu `TypeError` thì tự fallback sang `use_auth_token=` (bản cũ hơn) - không cần biết trước máy nào cài bản nào.
+- `main.py`: bọc try/except quanh toàn bộ khối diarization + speaker recognition - lỗi ở đây giờ chỉ log `"Speaker diarization skipped (failed: ...)"` rồi tiếp tục sang topic segmentation + ghi markdown, không còn mất công sức Whisper đã làm.
+
+**Test mới (19 test, 118 → 137)**:
+- `test_utils.py` (mới, 5 test) - `extract_text_from_anthropic_response()`: 1 block text, thinking-rồi-text (đúng bug thật), nhiều block text nối lại, không có block text nào, block thiếu hẳn attribute `.type`.
+- `test_correct_transcript.py` - cập nhật fake response cho đúng có `type="text"` (bản test cũ vô tình không bắt được bug này vì `MagicMock` tự sinh `.type` giả, không phải chuỗi `"text"` thật), thêm 1 test regression đúng kịch bản ThinkingBlock đứng trước.
+- `test_enrich.py` (**mới hoàn toàn**, 8 test) - `segment_topics()` trước đây chưa từng có test riêng dù đã có từ những vòng đầu của project. Cùng mức test rigor như `test_correct_transcript.py`, gồm cả regression test ThinkingBlock.
+- `test_diarize.py` - thêm class `TestDiarizeAudioParamCompat` (4 test): `token=` thành công ngay, fallback `use_auth_token=` khi `token=` bị `TypeError`, xác nhận `TypeError` từ chính lúc chạy diarization (không phải từ `from_pretrained()`) vẫn propagate bình thường chứ không bị nhầm là cần fallback, nhiều turn/nhiều speaker đi qua đúng. Dùng kỹ thuật `sys.modules` injection cho module có dấu chấm (`pyannote.audio`) - lần đầu áp dụng kỹ thuật này cho 1 package con thay vì package gốc như `anthropic`.
+- `test_run_pipeline.py` - thêm `test_diarization_failure_is_caught_and_pipeline_continues`: diarization lỗi → `assign_speakers`/`load_profiles` không được gọi, nhưng `write_markdown` vẫn chạy và `run_pipeline()` vẫn trả về bình thường, không raise.
+
+Đã chạy lại toàn bộ `tests/run_all.py -v`: **137/137 pass**. `try_pipeline.py` sẽ được chạy lại thật trên máy bạn để xác nhận cả 2 lỗi đã hết (kết quả sẽ cập nhật sau khi bạn chạy).
+
+### 9.8 Log token usage thật cho mỗi lần gọi Claude (137 → 139 test)
+
+Bạn hỏi "lượng token tốn là bao nhiêu" - code trước đó không hề log usage thật, chỉ có thể ước tính. Thêm `log_anthropic_usage(response, log)` vào `pipeline/utils.py` - đọc `response.usage.input_tokens`/`.output_tokens` (luôn có mặt trên response thật từ SDK `anthropic`), log 1 dòng `"Claude usage: N input + M output tokens"`. Gọi ngay sau mỗi `client.messages.create(...)` ở cả `correct.py` và `enrich.py`, trước khi parse response - nên vẫn log được ngay cả khi parse thất bại sau đó (đúng như log thật sau này cho thấy ở 9.10, dòng usage xuất hiện trước dòng "skipped" khi correction lỗi).
+
+Test mới trong `test_utils.py`: log đúng khi có `usage`, không log/không raise khi response không có attribute `usage` (phòng trường hợp SDK hoặc bản mock cũ chưa có field này). 137 → 139 test, `run_all.py -v` pass.
+
+### 9.9 Diarization (pyannote) cũng tự chuyển sang GPU nếu có - trước đây luôn chạy CPU (139 → 141 test)
+
+Bạn hỏi có cách nào chạy nhanh hơn không, gửi ảnh xác nhận máy có GPU rời thật (NVIDIA RTX 3060 Laptop, 6GB VRAM riêng - "GPU 1" trong Task Manager, khác "GPU 0" là Intel UHD tích hợp không dùng được CUDA). Đọc lại code phát hiện: `transform.py` (Whisper) đã tự nhận `device = "cuda" if torch.cuda.is_available() else "cpu"` từ trước, nhưng `diarize.py` (pyannote) thì **không hề** - `Pipeline.from_pretrained()` luôn load lên CPU, dòng log cũ còn ghi cứng "this can take a while on CPU" bất kể máy có GPU hay không. Đây là một khoảng trống thật, không phải lỗi mới phát sinh.
+
+Sửa: thêm cùng logic `device = torch.device("cuda" if torch.cuda.is_available() else "cpu")` rồi `pipeline = pipeline.to(device)` ngay sau khi load pipeline, trước khi chạy diarization - không đổi hành vi nếu máy không có CUDA torch (tự rơi về CPU y như cũ). Test mới trong `test_diarize.py`: thêm helper giả `torch` (`_fake_torch_module`) vì môi trường review không cài `torch` thật; `instance.to.return_value = instance` để mock phản ánh đúng hành vi thật của `.to(device)` (mutate in-place, trả về chính nó) - nếu không sẽ làm 4 test cũ của `TestDiarizeAudioParamCompat` fail vì `pipeline(audio_path)` sau đó gọi nhầm vào 1 mock con chưa cấu hình; thêm 2 test mới xác nhận đúng `.to()` được gọi với `cpu`/`cuda` tương ứng. 139 → 141 test, pass.
+
+**Lưu ý quan trọng: việc này không đánh đổi độ chính xác** - vẫn đúng model, đúng phép tính, chỉ chạy trên phần cứng khác. Bạn cần tự cài lại `torch` bản CUDA trên máy Windows thật (`pip install torch --index-url https://download.pytorch.org/whl/cu126`) - không làm được từ môi trường cầu nối review.
+
+### 9.10 Chạy thật full pipeline trên video gốc 2 tiếng — lỗi thật thứ 3: correction thất bại hoàn toàn trên video dài, sửa bằng cách chia batch (141 → 148 test)
+
+Bạn chạy `try_pipeline.py` thật trên `DA_Buổi_1.mp4` (7162s, ~2 tiếng) sau khi các thay đổi ở 9.8-9.9. Kết quả log thật:
+
+- **TRANSFORM (Whisper)**: chạy CPU (`Using device: cpu` - torch CUDA của 9.9 chưa được cài vào lúc chạy lần này), 24 chunk, tổng **10816.9s (~3 tiếng)**.
+- **CORRECTION: thất bại hoàn toàn.** `Claude usage: 43786 input + 8000 output tokens` rồi ngay sau đó `Transcript correction skipped (Claude call failed: Expecting value: line 1 column 1 (char 0))`. Output đúng bằng **8000** - đúng giới hạn `max_tokens` vừa tăng gấp đôi (4000→8000) ở phiên trước - nghĩa là dù đã tăng cap, vẫn bị cắt. Lỗi `"Expecting value: line 1 column 1 (char 0)"` là dấu hiệu đặc trưng của `json.loads("")` - chuỗi rỗng. Kết luận: với transcript ~1500 dòng dồn vào 1 lần gọi, model dùng **toàn bộ** ngân sách output cho phần "suy nghĩ" (extended thinking) nội bộ, không còn chỗ để viết ra JSON trả lời - `response.content` chỉ có `ThinkingBlock`, không có block `text` nào, nên `extract_text_from_anthropic_response()` trả về `""`. Đây chính là lỗi bạn nghi ngờ khi hỏi "bản này chưa chuẩn hoá API Anthropic phải k" về file transcript ngày 23-09-26 - **đúng, đã xác nhận bằng log thật**: correction chưa bao giờ chạy thành công cho video đó.
+- **DIARIZATION: thất bại** (403, không liên quan đến bug trên) - `Access to model pyannote/speaker-diarization-community-1 is restricted`. Đây là do tài khoản HuggingFace đứng sau `HUGGINGFACE_TOKEN` **chưa accept điều khoản** của model gated này trên trang https://hf.co/pyannote/speaker-diarization-community-1 - cần bạn tự đăng nhập đúng tài khoản đó và bấm chấp nhận, không phải lỗi code.
+- **TOPIC SEGMENTATION: thành công.** `Claude usage: 43635 input + 2403 output tokens` → 30 topic - khớp đúng 30 tiêu đề `##` mà bạn thấy trong file đã upload. Cap `enrich.py` vừa tăng (2000→4000 ở phiên trước) vừa đủ dư - nếu vẫn giữ 2000 cũ thì bước này (2403 output) **cũng đã fail theo đúng cách tương tự**.
+
+**Bài học rút ra: chỉ tăng `max_tokens` không phải là fix đúng** - vì "suy nghĩ" nội bộ của model tăng theo độ phức tạp/độ dài input, tăng cap mãi vừa tốn tiền vừa không có điểm dừng an toàn cho video càng lúc càng dài hơn. Cách sửa đúng: **chia transcript thành nhiều batch nhỏ** cho bước correction, giống hệt cách `transform.py` đã chia chunk cho Whisper từ đầu - mỗi lần gọi Claude chỉ xử lý 1 phần nhỏ transcript, giữ input/thinking/output luôn nhỏ và ổn định bất kể video dài bao nhiêu.
+
+**Thay đổi trong `correct_transcript_errors()`** (`pipeline/enrich/correct.py`): thêm tham số `batch_size` (mặc định 150, cấu hình qua `CORRECTION_BATCH_SIZE` trong `.env`/`config.py`). Transcript được chia thành các batch `batch_size` dòng, mỗi batch 1 lần gọi Claude riêng, đánh số dòng theo **chỉ số toàn cục** (`_build_numbered_transcript(..., start_index=batch_start)`) để index Claude trả về map thẳng vào segment gốc, không cần remap. Một batch lỗi (network, JSON hỏng, response rỗng như lỗi thật vừa gặp, index ngoài phạm vi) chỉ log cảnh báo và bỏ qua batch đó (`continue`) - **không còn huỷ toàn bộ correction của cả video** như thiết kế cũ (1 lỗi = huỷ hết). Việc kiểm tra index hợp lệ (`0 <= idx < len(segments)`) vẫn giữ nguyên logic phòng thủ cũ, chỉ thu hẹp phạm vi ảnh hưởng xuống 1 batch thay vì cả response. `main.py` truyền `batch_size=CONFIG["correction_batch_size"]` vào lời gọi.
+
+**Test mới (7 test) trong `test_correct_transcript.py`, class `TestCorrectTranscriptErrorsBatching`**: transcript nhỏ hơn batch_size → đúng 1 lần gọi (giữ nguyên hành vi cũ, 14 test cũ đều pass không cần sửa gì); transcript lớn hơn → đúng số lần gọi tương ứng; batch thứ 2 đánh số dòng bắt đầu từ chỉ số toàn cục (không phải `[0]`); correction từ mọi batch đều được áp dụng đúng; 1 batch lỗi mạng không làm mất correction của batch khác; 1 batch trả index ngoài phạm vi không ảnh hưởng batch khác; và quan trọng nhất - **regression test đúng y hệt lỗi thật vừa gặp** (response không có block `text` nào → `extract_text_from_anthropic_response()` trả `""` → batch đó bị bỏ qua, nhưng batch khác vẫn áp dụng bình thường).
+
+Đã chạy lại toàn bộ `tests/run_all.py -v`: **148/148 pass**. Batch size mặc định 150 dòng: với video 2 tiếng thật (~1500 dòng, 43786 token input cho cả transcript / ~1500 dòng ≈ 29 token/dòng), mỗi batch ~150 dòng chỉ khoảng ~4300 token input - dư sức nằm trong ngân sách 8000 token output kể cả phần thinking. Chưa chạy lại thật trên video gốc để xác nhận correction chạy hết cả 2 tiếng không lỗi batch nào - cần bạn chạy `try_pipeline.py` lại lần nữa.
+
+### 9.11 Diarization lỗi thật thứ 4: `torchcodec` không load được DLL trên Windows - sửa bằng cách bỏ qua torchcodec hoàn toàn (149 test)
+
+Sau khi bạn accept điều khoản HuggingFace (9.10 đóng lại), diarization tải model thành công (`config.yaml`, `segmentation/pytorch_model.bin`, `plda/*.npz`, `embedding/pytorch_model.bin`) nhưng gặp lỗi mới khi thực sự chạy:
+
+```
+Speaker diarization skipped (failed: Could not load libtorchcodec. Likely causes:
+  1. FFmpeg is not properly installed...
+  2. The PyTorch version (2.14.0+cpu) is not compatible with this version of TorchCodec...
+```
+
+Nguyên nhân: gọi `pipeline(audio_path)` (truyền đường dẫn file) khiến pyannote.audio tự giải mã audio nội bộ qua `torchcodec` - một thư viện Meta mới, **khác hoàn toàn** với `ffmpeg.exe` project này đã dùng cho EXTRACT. `torchcodec` cần bộ DLL FFmpeg dạng "shared" (không phải bản `ffmpeg.exe` đơn lẻ thường tải trên Windows) để `ctypes` load động lúc chạy - máy bạn không có bộ DLL đó nên load thất bại ở mọi phiên bản FFmpeg nó thử (4 đến 9).
+
+Đã tra cứu kỹ trước khi sửa (tài liệu chính thức của model + các issue thật trên GitHub `pyannote-audio`/`torchcodec`) thay vì đoán: cách sửa đúng không phải là cài thêm FFmpeg "full-shared" build + chỉnh PATH (phức tạp, dễ vỡ, phải cài lại mỗi khi đổi máy) mà là **tránh dùng torchcodec hoàn toàn** - model card chính thức của `pyannote/speaker-diarization-community-1` trên HuggingFace xác nhận pipeline nhận cả 2 kiểu input: đường dẫn file (kích hoạt torchcodec) hoặc dict `{"waveform": tensor, "sample_rate": int}` đã load sẵn bằng `torchaudio.load()` (không đụng torchcodec).
+
+Sửa trong `diarize_audio()` (`pipeline/enrich/diarize.py`): thêm `import torchaudio`, thay `pipeline(audio_path)` bằng:
+```python
+waveform, sample_rate = torchaudio.load(audio_path)
+diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate})
+```
+`torchaudio` đã có sẵn (dependency bắc cầu của `pyannote.audio`), không cần cài thêm gì.
+
+Test: thêm `_fake_torchaudio_module()` vào `test_diarize.py` (cùng kỹ thuật `sys.modules` injection như `torch`/`pyannote.audio`), gắn vào cả 6 test của `TestDiarizeAudioParamCompat` cần nó; thêm 1 test regression mới xác nhận `torchaudio.load()` được gọi đúng với `audio_path`, và pipeline được gọi với **dict** `{"waveform":, "sample_rate":}` chứ không phải chuỗi đường dẫn thô - khoá đúng hành vi vừa sửa. 149/149 pass.
+
+Chưa chạy lại thật trên máy bạn để xác nhận lỗi `libtorchcodec` đã hết - cần bạn chạy lại `try_pipeline.py` (clip ngắn trước) sau khi pull thay đổi này.
+
+### 9.12 Sửa lại 9.11 - `torchaudio.load()` KHÔNG né được torchcodec như đã nghĩ, đổi sang `soundfile` (149 test)
+
+Bạn chạy lại clip ngắn sau bản sửa 9.11, **vẫn dính đúng lỗi `libtorchcodec` y hệt** - chỉ khác ở chỗ thông báo giờ ghi `"Failed to create AudioDecoder for ...DA_Buổi_1_short.wav"`. Đây là bằng chứng fix ở 9.11 sai: `torchaudio.load()` **không né được torchcodec** trên phiên bản `torchaudio` đi kèm `torch 2.14.0+cpu` của bạn - các bản `torchaudio` gần đây (≈2.9 trở lên) đã chuyển sang **tự dùng torchcodec làm backend nội bộ**, nên gọi `torchaudio.load()` vẫn kích hoạt đúng lỗi DLL cũ, chỉ đi vòng thêm 1 lớp. Đã kiểm chứng lại qua nhiều nguồn (issue thật trên GitHub của `torchaudio`/`torchcodec`/dự án khác gặp đúng lỗi này) trước khi sửa lần 2, không đoán mò tiếp.
+
+**Sửa đúng lần này:** dùng `soundfile` (thư viện `libsndfile`, hoàn toàn tách biệt khỏi FFmpeg/torchcodec, có sẵn DLL đóng gói trong wheel Windows - không cần cài thêm gì trên máy) để tự đọc file `.wav` thành mảng số, rồi mới đưa vào `pipeline({"waveform":, "sample_rate":})`. An toàn để dùng ở đây vì `diarize_audio()` **luôn luôn** chỉ nhận file `.wav` do chính EXTRACT stage của project này tạo ra (16kHz mono 16-bit PCM - xem `pipeline/extract/extract.py`), không phải định dạng bất kỳ cần bộ giải mã đa năng như torchcodec/FFmpeg.
+
+```python
+data, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
+waveform = torch.from_numpy(data.T)  # (samples, channels) -> (channels, samples)
+diarization = pipeline({"waveform": waveform, "sample_rate": sample_rate})
+```
+
+Thêm `soundfile` vào `requirements.txt` (dependency mới, nhẹ, có wheel sẵn cho Windows). Cập nhật `test_diarize.py`: đổi fake `torchaudio` (9.11) thành fake `soundfile` - dùng numpy array thật (không phải `MagicMock`) vì code gọi `.T` lên kết quả; cập nhật test regression để xác nhận đúng `sf.read(audio_path, dtype="float32", always_2d=True)` được gọi và pipeline nhận đúng dict `{"waveform": <mảng đã transpose>, "sample_rate":}`. 149/149 pass.
+
+**Bài học đáng nói thẳng:** fix ở 9.11 dựa trên tài liệu/case study viết cho phiên bản `torchaudio` cũ hơn, không kiểm tra được hành vi thật trên phiên bản mới bạn đang cài (không thể test được từ môi trường review vì không có `torch`/`torchaudio` thật) - nên đưa ra 1 fix tưởng đúng nhưng không né được vấn đề gốc. Lần này dùng `soundfile` triệt để tách khỏi cả torchaudio lẫn torchcodec nên không còn phụ thuộc vào việc phiên bản nào dùng backend nào nữa. Vẫn cần bạn chạy lại `try_pipeline.py` (clip ngắn) để xác nhận lần này thật sự hết lỗi.
+
+### 9.13 Lỗi thật thứ 5: pyannote.audio 4.x bọc kết quả trong `DiarizeOutput`, không trả `Annotation` trực tiếp nữa (151 test)
+
+Fix `soundfile` ở 9.12 **đã đúng** - lỗi `libtorchcodec` biến mất hoàn toàn, diarization chạy thật (~3 phút tính toán trên CPU cho clip 3 phút, thấy rõ qua thời gian `[370.8s]` → `[548.9s]`). Nhưng ngay sau khi chạy xong lại lỗi tiếp, khác hẳn 4 lỗi trước:
+
+```
+Speaker diarization skipped (failed: 'DiarizeOutput' object has no attribute 'itertracks')
+```
+
+Tra lại thấy: `pip install -r requirements.txt` trên máy bạn đã kéo về `pyannote.audio 4.0.7` (log `pip install` xác nhận), bản này **đổi kiểu dữ liệu trả về** của pipeline - trước đây gọi `pipeline(...)` trả thẳng 1 `Annotation` (có `.itertracks()`), giờ trả về 1 dataclass `DiarizeOutput` bọc bên ngoài, `Annotation` thật nằm ở thuộc tính `.speaker_diarization` (xác nhận qua tài liệu chính thức của model trên HuggingFace: `for turn, speaker in output.speaker_diarization`).
+
+Sửa trong `diarize_audio()`: bóc `Annotation` ra bằng `getattr(result, "speaker_diarization", result)` - nếu `result` có `.speaker_diarization` (pyannote 4.x) thì dùng nó, không thì coi `result` chính là `Annotation` luôn (pyannote cũ hơn, trước 4.0) - cùng tinh thần với cách xử lý tương thích `token=`/`use_auth_token=` đã làm ở 9.7, không cần biết trước máy nào cài bản nào.
+
+Test: cập nhật `_fake_pipeline_instance()` để nhận thêm tham số `wrap_in_diarize_output` - mô phỏng đúng 2 kiểu trả về (bọc/không bọc); phải dùng `del mock.speaker_diarization` cho nhánh "không bọc" vì `MagicMock` tự sinh thuộc tính bất kỳ khi truy cập, nếu không xóa thì `getattr(..., default)` sẽ không bao giờ rơi vào nhánh fallback thật sự (bug tiềm ẩn trong chính cách viết test, không phải trong code chạy thật - đáng chú ý). Thêm 2 test mới: 1 cho kiểu bọc (`DiarizeOutput`, pyannote 4.x - đúng bug thật vừa gặp), 1 cho kiểu không bọc (Annotation trực tiếp, pyannote cũ) - đảm bảo sửa 1 bên không phá bên kia. 151/151 pass.
+
+Tổng cộng đã tìm + sửa **5 lỗi thật khác nhau** chỉ riêng cho bước diarization qua các lượt chạy thật liên tiếp (403 gated repo → libtorchcodec qua torchaudio → libtorchcodec qua torchcodec trực tiếp → DiarizeOutput) - mỗi lỗi chỉ lộ ra sau khi lỗi trước đó được sửa, đúng kiểu "bóc từng lớp" khi chạy thật trên máy với phiên bản dependency mới hơn nhiều so với lúc code được viết ban đầu. Cần bạn chạy lại `try_pipeline.py` lần nữa để xác nhận diarization ra kết quả đúng (có tên/label speaker trong file markdown).
+
+
+### 9.14 Lỗi thật thứ 6 (cùng họ torchcodec): bước tính voice embedding cũng dính lỗi y hệt diarization - gộp fix dùng chung (151 → 171 test)
+
+Bạn chạy lại `try_pipeline.py` sau khi fix `DiarizeOutput` ở 9.13 - lần này **diarization chạy đúng hoàn toàn**: `Diarization found 1 speaker(s) across 26 turn(s).` (xác nhận cả fix `soundfile` ở 9.12 lẫn fix `DiarizeOutput` ở 9.13 đều đã đúng). Nhưng ngay bước tiếp theo, "Loading speaker embedding model..." (tính voice embedding để nhận diện người nói qua `speaker_id.py`), lại gặp lại **đúng lỗi `libtorchcodec`** đã sửa ở 9.12 cho diarization - lặp lại nhiều lần (mỗi turn tính embedding bị lỗi 1 lần), kết thúc bằng `Computed voice embeddings for 0/1 speaker(s).`. Pipeline không sập (bước này vốn đã có try/except từng turn từ đầu), nhưng toàn bộ chức năng nhận diện người nói qua tên thực tế không hoạt động - transcript vẫn ra nhưng speaker label chỉ là "Speaker 1" thay vì tên thật đã enroll.
+
+Nguyên nhân giống hệt 9.11/9.12: `pipeline/enrich/speaker_id.py`'s `_embed_turns()` gọi `inference.crop(audio_path, Segment(start, end))` - truyền thẳng **đường dẫn file** (chuỗi) cho mỗi turn cần tính embedding, y hệt cách `diarize_audio()` từng gọi `pipeline(audio_path)` trước khi sửa ở 9.12. `pyannote.audio`'s `Inference.crop()` xử lý input kiểu path giống hệt `Pipeline.__call__()` - đều đi qua `Audio.crop()` nội bộ, và khi input là path thì nó tự giải mã qua `torchcodec` bất kể lời gọi đến từ `Pipeline` hay `Inference`. Đã tra lại mã nguồn thật của `pyannote-audio` trên GitHub (`core/inference.py`, `core/io.py`) để xác nhận trước khi sửa, không đoán: `AudioFile` (kiểu tham số `file` của cả `Pipeline` lẫn `Inference`) chấp nhận `str | Path | IOBase | Mapping` - truyền dict `{"waveform": tensor, "sample_rate": int}` thay vì path khiến `Audio` **bỏ qua hoàn toàn** bước giải mã qua torchcodec, dùng thẳng tensor đã có sẵn - đúng cơ chế đã dùng cho diarization ở 9.12, giờ áp dụng lại cho embedding.
+
+**Sửa bằng cách gộp logic dùng chung, không lặp lại:** thay vì copy nguyên khối `sf.read()`/`torch.from_numpy()` từ `diarize.py` sang `speaker_id.py` lần hai, tách thành 1 hàm chung `load_waveform(audio_path)` trong `pipeline/utils.py` (nơi các hàm chia sẻ giữa các stage khác - `extract_text_from_anthropic_response()`, `log_anthropic_usage()` - đã sẵn có) - trả về đúng dict `{"waveform", "sample_rate"}` mà cả `Pipeline` lẫn `Inference` đều chấp nhận. `diarize_audio()` giờ gọi `pipeline(load_waveform(audio_path))` thay vì tự đọc file; `speaker_id.py` gọi `load_waveform()` **một lần duy nhất cho mỗi video** (trong `compute_speaker_centroids()`, trước vòng lặp qua từng speaker, và trong `enroll_speaker()`) rồi truyền cùng 1 object đã load sẵn xuống `_embed_turns()` cho mọi turn của mọi speaker - vừa sửa đúng lỗi torchcodec, vừa tránh đọc lại file audio từ đĩa nhiều lần một cách lãng phí (trước đây nếu sửa nông theo kiểu "đổi `audio_path` thành gọi `sf.read` ngay trong `_embed_turns()`" thì sẽ đọc lại file mỗi turn - đây là cải tiến đi kèm, không chỉ là fix lỗi).
+
+Cả `compute_speaker_centroids()` lẫn `enroll_speaker()` đều bọc bước `load_waveform()` trong try/except: nếu audio không đọc được (file hỏng/thiếu), `compute_speaker_centroids()` log cảnh báo và trả về `{}` như mọi lỗi khác ở stage này (giữ đúng triết lý "không bao giờ làm hỏng pipeline chính" đã nêu ở đầu file `speaker_id.py`), còn `enroll_speaker()` (CLI riêng, không phải 1 bước trong pipeline chính) để lỗi tự raise lên như cũ vì đây là lệnh chạy tay, cần người dùng biết ngay khi input hỏng.
+
+**Test mới (20 test, 151 → 171)**:
+- `test_utils.py`, class `TestLoadWaveform` (2 test) - xác nhận `sf.read()` được gọi đúng tham số (`dtype="float32", always_2d=True`), và kết quả trả về đúng dict `{"waveform", "sample_rate"}` với waveform đã transpose sang `(channels, samples)`.
+- `test_diarize.py` - không cần sửa gì: các test cũ của `TestDiarizeAudioParamCompat` (bao gồm test regression "gọi bằng dict, không phải path" ở 9.12) vẫn pass nguyên sau khi đổi sang gọi `load_waveform()` từ `pipeline/utils.py`, vì kỹ thuật giả lập `sys.modules` cho `torch`/`soundfile` không quan tâm module nào thực sự gọi `import torch`/`import soundfile` - chỉ cần đúng module đó được import trong lúc patch còn hiệu lực.
+- `test_speaker_id.py` - trước đây file này ghi rõ trong docstring là "không test phần cần model thật" (`_embed_turns`/`compute_speaker_centroids`/`enroll_speaker` chưa từng có test). Giờ áp dụng đúng kỹ thuật `sys.modules` injection đã dùng cho `pyannote.audio` ở `test_diarize.py`, mở rộng thêm cho `pyannote.core.Segment`:
+  - `TestEmbedTurns` (7 test) - `inference.crop()` nhận đúng object audio đã preload (không phải path/chuỗi); nhiều turn được tính trung bình đúng; turn ngắn hơn ngưỡng tối thiểu (1.5s) bị bỏ qua khi có turn dài hơn; nếu mọi turn đều ngắn thì vẫn dùng hết (không bỏ hoàn toàn); giới hạn đúng số turn tối đa mỗi speaker (5, ưu tiên turn dài nhất); 1 turn lỗi không làm mất kết quả turn khác; mọi turn đều lỗi thì trả `None`.
+  - `TestComputeSpeakerCentroids` (6 test) - mỗi speaker ra đúng 1 centroid; **regression test quan trọng nhất**: file audio chỉ đọc từ đĩa đúng 1 lần dù có nhiều speaker (khoá đúng cải tiến "load 1 lần" vừa nêu trên); turn cùng speaker label được gộp đúng nhóm; model tải lỗi hoặc audio đọc lỗi đều rơi về `{}` chứ không raise.
+  - `TestEnrollSpeaker` (5 test) - `inference.crop()` cũng nhận đúng object đã preload (cùng bug, khác điểm gọi - trước giờ enroll_speaker.py's CLI chưa từng được test); enroll người mới tạo đúng profile; enroll lại người cũ gộp đúng theo trung bình có trọng số (`sample_count`); `update_existing=False` thêm profile mới thay vì gộp; không tính được embedding nào thì raise đúng `RuntimeError`.
+
+Đã chạy lại toàn bộ `tests/run_all.py -v`: **171/171 pass**. Tổng cộng đã tìm + sửa **6 lỗi thật khác nhau** cùng họ dependency (pyannote.audio/torch/torchcodec) qua các lượt chạy thật liên tiếp trên máy Windows của bạn - lỗi cuối này chỉ lộ ra sau khi 5 lỗi trước đó (403 gated repo → libtorchcodec qua torchaudio → libtorchcodec qua torchcodec trực tiếp → DiarizeOutput → giờ là embedding) đều đã được sửa, vì bước tính embedding chỉ chạy được sau khi diarization tự nó chạy xong. Cần bạn chạy lại `try_pipeline.py` (clip ngắn trước) để xác nhận `Computed voice embeddings for N/N speaker(s)` (khác `0/N` như log lần trước) - nếu bạn đã enroll sẵn người nói nào trong `speaker_profiles.json`, đây cũng là lúc xác nhận tên thật xuất hiện đúng trong file markdown thay vì "Speaker 1".
+
+
+### 9.15 Xác nhận fix 9.14 đúng qua log thật + 1 lỗi nhỏ thêm phát hiện được: token HuggingFace không thực sự được dùng khi tải model embedding (171 → 174 test)
+
+Bạn chạy lại `try_pipeline.py` trên clip ngắn sau bản sửa 9.14 - **toàn bộ pipeline chạy thành công từ đầu đến cuối, không còn lỗi nào**:
+
+```
+[  360.0s] Corrected 8 likely transcription error(s).
+[  583.3s] Diarization found 1 speaker(s) across 26 turn(s).
+[  585.9s] Computed voice embeddings for 1/1 speaker(s).
+[  589.1s] Found 3 topic(s).
+[  589.1s] Done! Result: ...transcript.md
+```
+
+`Computed voice embeddings for 1/1 speaker(s)` (thay vì `0/1` như log trước 9.14) xác nhận đúng cả 2 phần của fix 9.14: lỗi `libtorchcodec` đã hết hoàn toàn, và việc gộp logic đọc audio dùng chung qua `pipeline.utils.load_waveform()` hoạt động đúng ở cả 2 chỗ gọi (diarization lẫn embedding).
+
+Trong log này có 1 dòng cảnh báo (không phải lỗi) đáng chú ý: `Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.` xuất hiện ngay trước lúc tải model embedding. Tra lại thấy đây là **cùng họ lỗi đã sửa ở 9.7** (`huggingface_hub` đổi tên tham số `use_auth_token` thành `token`) nhưng ở 1 điểm gọi khác chưa được sửa: `_load_embedding_model()` (`speaker_id.py`) vẫn gọi `Model.from_pretrained(_EMBEDDING_MODEL_NAME, use_auth_token=hf_token)` - khác với `Pipeline.from_pretrained()` trong `diarize.py` đã có fallback `token=`/`use_auth_token=` từ 9.7.
+
+Đã tra lại mã nguồn thật của `pyannote-audio` (`core/model.py` trên GitHub) trước khi sửa: `Model.from_pretrained()` bản hiện tại khai báo rõ tham số `token=` trong signature, nhưng **không** raise lỗi khi nhận `use_auth_token=` như `Pipeline.from_pretrained()` làm - nó âm thầm gom vào `**kwargs` rồi chuyển xuống hàm load checkpoint nội bộ (PyTorch Lightning), nghĩa là token **không hề được dùng để xác thực với HuggingFace Hub**. Vì model `pyannote/wespeaker-voxceleb-resnet34-LM` không bị gate nên tải vẫn thành công (không sập), chỉ là chạy ở chế độ ẩn danh (giới hạn tốc độ thấp hơn, không có lợi ích gì từ `HUGGINGFACE_TOKEN` đã cấu hình) - đúng như cảnh báo nói.
+
+Sửa: áp dụng đúng pattern try/except đã dùng cho `Pipeline.from_pretrained()` ở 9.7 - thử `token=hf_token` trước (đúng tên hiện tại), rơi về `use_auth_token=hf_token` nếu `TypeError` (bản `pyannote.audio` cũ hơn không có tham số `token=`). Không cần biết trước máy nào cài bản nào, cùng tinh thần nhất quán với `diarize.py`.
+
+Test mới (3 test, class `TestLoadEmbeddingModelParamCompat` trong `test_speaker_id.py`): dùng `token=` thành công ngay không cần fallback; fallback đúng sang `use_auth_token=` khi `token=` bị `TypeError`; `Inference()` được khởi tạo đúng với model đã tải và `window="whole"`. 171 → 174 test, `run_all.py -v` pass toàn bộ.
+
+**Không phải lỗi chặn pipeline** (model không bị gate nên vẫn tải và chạy đúng), nhưng đáng sửa vì: (1) đúng cùng root cause đã biết là bug thật ở 9.7, chỉ chưa lan hết sang mọi điểm gọi `from_pretrained()` trong project; (2) nếu sau này HuggingFace đổi chính sách gate cho model này, hoặc bạn bị giới hạn tốc độ do request ẩn danh, token vẫn sẽ không được dùng dù đã cấu hình đúng trong `.env` - lỗi sẽ khó nhận ra vì không hề raise exception, chỉ có 1 dòng warning dễ bị bỏ qua giữa log dài. Bạn chạy lại `try_pipeline.py` (không cần thiết vì không có lỗi cần xác nhận hết) hoặc yên tâm bỏ qua bước xác nhận này - lần chạy tiếp theo sẽ không còn dòng cảnh báo "unauthenticated requests" đó nữa nếu muốn kiểm tra cho chắc.

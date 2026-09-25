@@ -136,6 +136,8 @@ def extract_audio(
     shorter than a spoken word, so it does not meaningfully affect
     transcription quality.
     """
+    os.makedirs(os.path.dirname(audio_path) or ".", exist_ok=True)
+
     if duration is None or duration < _MIN_DURATION_FOR_CHUNKED_EXTRACT_SECONDS:
         _extract_audio_single_pass(video_path, audio_path)
         return

@@ -16,7 +16,7 @@ import sys
 import shutil
 import tempfile
 
-from config import CONFIG, OUTPUT_DIR
+from config import CONFIG, RAW_AUDIO_DIR, PROCESSED_DIR
 from pipeline.utils import check_ffmpeg_available
 from pipeline.extract.extract import probe_media_info, extract_audio
 from pipeline.transform.transform import load_whisper_model, transform_to_segments
@@ -37,8 +37,19 @@ def run_pipeline(video_path: str, log) -> str:
     check_ffmpeg_available()
 
     video_path = os.path.abspath(video_path)
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+
+    # The raw extracted audio is a real, reusable output now, not a temp
+    # file - saved under output/raw/, keyed by video name only (not date):
+    # re-running the same video overwrites it, since it's the exact same
+    # audio either way - unlike the Markdown transcript below, nothing
+    # about a later run changes what a video sounds like, so dating this
+    # copy too would just pile up duplicate multi-hundred-MB files.
+    audio_path = os.path.join(RAW_AUDIO_DIR, f"{video_name}.wav")
+
+    # Whisper's own chunk_*.wav files (created inside TRANSFORM) are the
+    # only thing that still lives here - a true, short-lived temp dir.
     tmp_dir = tempfile.mkdtemp(prefix="video2text_")
-    audio_path = os.path.join(tmp_dir, "audio.wav")
 
     try:
         # ------------------------------------------------------------------
@@ -71,27 +82,38 @@ def run_pipeline(video_path: str, log) -> str:
             segments = correct_transcript_errors(
                 segments, video_path, CONFIG["domain_vocabulary"],
                 CONFIG["anthropic_api_key"], CONFIG["anthropic_model"], log,
+                batch_size=CONFIG["correction_batch_size"],
             )
         else:
             log("No ANTHROPIC_API_KEY set - skipping transcript correction.")
 
         # Speaker diarization + recognition - optional, needs HUGGINGFACE_TOKEN.
+        # Wrapped in try/except so it follows the same never-crash-the-pipeline
+        # rule as transcript correction/topic segmentation above/below: a bad
+        # token, no network, or a pyannote/huggingface_hub version mismatch
+        # (this has happened - see CODE_REVIEW.md) must not throw away the
+        # transcription Whisper already did. A failure here just means the
+        # transcript comes out without speaker labels, same as if
+        # HUGGINGFACE_TOKEN had never been set.
         if CONFIG["huggingface_token"]:
-            turns = diarize_audio(audio_path, CONFIG["huggingface_token"], log)
-            segments = assign_speakers(segments, turns)
+            try:
+                turns = diarize_audio(audio_path, CONFIG["huggingface_token"], log)
+                segments = assign_speakers(segments, turns)
 
-            # Try to recognize enrolled speakers (pipeline/enrich/speaker_id.py). This
-            # only maps raw SPEAKER_XX labels to real names or "Speaker N" -
-            # it never fails the pipeline; a lookup problem just means every
-            # voice falls back to "Speaker 1", "Speaker 2"... (see that
-            # module's docstring).
-            profiles = load_profiles(CONFIG["speaker_profiles_path"])
-            centroids = compute_speaker_centroids(audio_path, turns, CONFIG["huggingface_token"], log)
-            name_map = match_speakers(centroids, profiles, CONFIG["speaker_match_threshold"])
-            segments = resolve_speaker_names(segments, name_map)
-            if name_map:
-                recognized = ", ".join(sorted(set(name_map.values())))
-                log(f"Recognized {len(name_map)} known speaker(s): {recognized}")
+                # Try to recognize enrolled speakers (pipeline/enrich/speaker_id.py). This
+                # only maps raw SPEAKER_XX labels to real names or "Speaker N" -
+                # it never fails the pipeline; a lookup problem just means every
+                # voice falls back to "Speaker 1", "Speaker 2"... (see that
+                # module's docstring).
+                profiles = load_profiles(CONFIG["speaker_profiles_path"])
+                centroids = compute_speaker_centroids(audio_path, turns, CONFIG["huggingface_token"], log)
+                name_map = match_speakers(centroids, profiles, CONFIG["speaker_match_threshold"])
+                segments = resolve_speaker_names(segments, name_map)
+                if name_map:
+                    recognized = ", ".join(sorted(set(name_map.values())))
+                    log(f"Recognized {len(name_map)} known speaker(s): {recognized}")
+            except Exception as exc:
+                log(f"Speaker diarization skipped (failed: {exc})")
         else:
             log("No HUGGINGFACE_TOKEN set - skipping speaker diarization.")
 
@@ -103,10 +125,10 @@ def run_pipeline(video_path: str, log) -> str:
             topics = []
 
         # ------------------------------------------------------------------
-        # LOAD: write the result to a Markdown file in output/ (pipeline/load/)
+        # LOAD: write the result to a Markdown file in output/processed/ (pipeline/load/)
         # ------------------------------------------------------------------
         log("Writing Markdown file...")
-        output_path = write_markdown(OUTPUT_DIR, video_path, segments, topics)
+        output_path = write_markdown(PROCESSED_DIR, video_path, segments, topics)
         log(f"Done! Result: {output_path}")
         return output_path
 

@@ -182,6 +182,22 @@ class TestHuggingfaceTokenGating(unittest.TestCase):
         for name in self._DIARIZATION_STAGES:
             mocks[name].assert_called_once()
 
+    def test_diarization_failure_is_caught_and_pipeline_continues(self):
+        # Regression test: a real pyannote/huggingface_hub version mismatch
+        # used to crash the whole pipeline here, throwing away the
+        # transcription Whisper already did (see CODE_REVIEW.md). Confirms
+        # the try/except added around this block in main.py actually
+        # protects the rest of the run - later stages still run and
+        # run_pipeline() returns normally instead of raising.
+        with mock.patch.dict(main.CONFIG, {"huggingface_token": "hf_token"}):
+            with _patched_stages(overrides={"diarize_audio": RuntimeError("pyannote boom")}) as mocks:
+                result = main.run_pipeline("video.mp4", _noop_log)
+
+        mocks["assign_speakers"].assert_not_called()
+        mocks["load_profiles"].assert_not_called()
+        mocks["write_markdown"].assert_called_once()
+        self.assertEqual(result, _DEFAULT_RETURNS["write_markdown"])
+
 
 class TestAnthropicApiKeyGating(unittest.TestCase):
     def test_correction_and_topics_skipped_when_no_key(self):

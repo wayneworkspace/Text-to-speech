@@ -14,6 +14,8 @@ the source transcript is.
 """
 import json
 
+from ..utils import extract_text_from_anthropic_response, log_anthropic_usage
+
 
 def _build_numbered_transcript(segments: list) -> str:
     lines = []
@@ -64,10 +66,11 @@ def segment_topics(segments: list, api_key: str, model: str, log) -> list:
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model=model,
-            max_tokens=2000,
+            max_tokens=4000,
             messages=[{"role": "user", "content": prompt}],
         )
-        topics = _parse_topics(response.content[0].text)
+        log_anthropic_usage(response, log)
+        topics = _parse_topics(extract_text_from_anthropic_response(response))
         log(f"Found {len(topics)} topic(s).")
         return topics
     except Exception as exc:

@@ -22,13 +22,34 @@ API cost) small regardless of transcript length, and is why "did the
 response include a line for every segment" is not the safety check here;
 instead, every returned index is bounds-checked before anything is
 touched.
+
+The transcript is also sent in batches of CONFIG["correction_batch_size"]
+lines per call (see correct_transcript_errors()'s `batch_size` arg), not
+as one call for the whole video. This was not a design choice up front -
+it was added after a real failure running this project on a ~2 hour
+video: one call covering all ~1500 lines spent its entire output budget
+on the model's own extended thinking and returned no text block at all,
+so the JSON parse failed on an empty string and correction silently never
+applied for that whole run (see CODE_REVIEW.md). Batching keeps each
+call's input/thinking/output small regardless of total video length, the
+same way pipeline/transform/transform.py already chunks Whisper
+transcription itself. A failed batch only loses that batch's lines - the
+rest of the video's corrections still apply.
 """
 import json
 import os
 
+from ..utils import extract_text_from_anthropic_response, log_anthropic_usage
 
-def _build_numbered_transcript(segments: list) -> str:
-    return "\n".join(f"[{i}] {seg['text'].strip()}" for i, seg in enumerate(segments))
+
+def _build_numbered_transcript(segments: list, start_index: int = 0) -> str:
+    """
+    `start_index` lets a batch's line numbers reflect its position in the
+    *full* transcript (not 0-based within the batch), so a correction's
+    "index" from any batch maps directly onto the original segments list
+    with no remapping needed at merge time.
+    """
+    return "\n".join(f"[{start_index + i}] {seg['text'].strip()}" for i, seg in enumerate(segments))
 
 
 def _parse_corrections(raw: str) -> dict:
@@ -49,35 +70,8 @@ def _parse_corrections(raw: str) -> dict:
     }
 
 
-def correct_transcript_errors(
-    segments: list, video_path: str, domain_vocabulary, api_key: str, model: str, log
-) -> list:
-    """
-    Ask Claude to fix likely mis-transcribed words, using the video's
-    filename and optional DOMAIN_VOCABULARY as context (both free - no need
-    to enumerate every term you expect in advance).
-
-    Only the "text" field of a segment is ever changed - start/end/speaker/
-    low_confidence are always left untouched, and segments are never added,
-    removed, or reordered.
-
-    Never raises: a bad key, network error, timeout, or malformed response
-    is logged and the original segments are returned unchanged, so a
-    correction problem can never break transcription or desync timestamps
-    with the rest of the pipeline.
-    """
-    if not segments:
-        return segments
-
-    log("Calling Claude to check for likely transcription errors...")
-    import anthropic
-
-    context_lines = [f"Video file name: {os.path.basename(video_path)}"]
-    if domain_vocabulary:
-        context_lines.append(f"Known domain vocabulary/terms that may appear: {domain_vocabulary}")
-
-    transcript = _build_numbered_transcript(segments)
-    prompt = (
+def _build_correction_prompt(context_lines: list, transcript: str) -> str:
+    return (
         "This is a numbered speech-to-text transcript that may contain mis-transcribed "
         "words - especially proper nouns (names, song/book/place titles) and technical or "
         "domain-specific terms the speech-to-text model did not recognize.\n\n"
@@ -94,30 +88,87 @@ def correct_transcript_errors(
         "Transcript:\n" + transcript
     )
 
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=model,
-            max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        corrections = _parse_corrections(response.content[0].text)
-    except Exception as exc:
-        log(f"Transcript correction skipped (Claude call failed: {exc})")
+
+def correct_transcript_errors(
+    segments: list, video_path: str, domain_vocabulary, api_key: str, model: str, log,
+    batch_size: int = 150,
+) -> list:
+    """
+    Ask Claude to fix likely mis-transcribed words, using the video's
+    filename and optional DOMAIN_VOCABULARY as context (both free - no need
+    to enumerate every term you expect in advance).
+
+    Only the "text" field of a segment is ever changed - start/end/speaker/
+    low_confidence are always left untouched, and segments are never added,
+    removed, or reordered.
+
+    Sends `segments` to Claude in batches of up to `batch_size` lines (see
+    CONFIG["correction_batch_size"] / module docstring for why) instead of
+    one call for the whole transcript. A batch that fails or comes back
+    malformed only costs that batch's lines - every other batch's
+    corrections still apply, so one bad chunk of a long video never
+    cancels correction for the whole thing.
+
+    Never raises: a bad key, network error, timeout, or malformed response
+    is logged and those lines are left unchanged, so a correction problem
+    can never break transcription or desync timestamps with the rest of
+    the pipeline.
+    """
+    if not segments:
         return segments
 
-    if not corrections:
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+
+    context_lines = [f"Video file name: {os.path.basename(video_path)}"]
+    if domain_vocabulary:
+        context_lines.append(f"Known domain vocabulary/terms that may appear: {domain_vocabulary}")
+
+    num_batches = (len(segments) + batch_size - 1) // batch_size
+    if num_batches > 1:
+        log(
+            f"Calling Claude to check for likely transcription errors "
+            f"({num_batches} batches of up to {batch_size} lines each)..."
+        )
+    else:
+        log("Calling Claude to check for likely transcription errors...")
+
+    all_corrections = {}
+    for batch_start in range(0, len(segments), batch_size):
+        batch = segments[batch_start: batch_start + batch_size]
+        transcript = _build_numbered_transcript(batch, start_index=batch_start)
+        prompt = _build_correction_prompt(context_lines, transcript)
+        batch_label = (
+            f"lines {batch_start}-{batch_start + len(batch) - 1}" if num_batches > 1 else "transcript"
+        )
+
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            log_anthropic_usage(response, log)
+            batch_corrections = _parse_corrections(extract_text_from_anthropic_response(response))
+        except Exception as exc:
+            log(f"Transcript correction skipped for {batch_label} (Claude call failed: {exc})")
+            continue
+
+        # Bounds-check every index before touching anything - one bad index
+        # from a malformed response must not leave this batch half-trusted.
+        # Scoped to this batch only, so it never costs other batches' results.
+        if any(idx < 0 or idx >= len(segments) for idx in batch_corrections):
+            log(f"Ignored corrections for {batch_label} (Claude returned an out-of-range segment index).")
+            continue
+
+        all_corrections.update(batch_corrections)
+
+    if not all_corrections:
         log("No likely transcription errors found.")
         return segments
 
-    # Bounds-check every index before touching anything - one bad index
-    # from a malformed response must not leave the transcript half-edited.
-    if any(idx < 0 or idx >= len(segments) for idx in corrections):
-        log("Transcript correction skipped (Claude returned an out-of-range segment index).")
-        return segments
-
     changed = 0
-    for idx, corrected_text in corrections.items():
+    for idx, corrected_text in all_corrections.items():
         if segments[idx]["text"].strip() != corrected_text.strip():
             segments[idx]["text"] = corrected_text
             changed += 1

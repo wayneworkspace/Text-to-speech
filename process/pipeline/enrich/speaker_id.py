@@ -16,6 +16,17 @@ and only runs when diarization already ran. Failures here should degrade to
 "no name resolved" (segments keep their raw SPEAKER_XX label), never break
 the rest of the pipeline - matches the philosophy of diarize.py/enrich.py.
 
+Turns are embedded from a pre-loaded {"waveform", "sample_rate"} dict
+(pipeline.utils.load_waveform()), not a bare file path - the exact same
+torchcodec DLL-loading failure diarize.py's diarize_audio() hit on Windows
+(see CODE_REVIEW.md) shows up here too, since pyannote.audio's
+Inference.crop() decodes a path-typed "file" internally via torchcodec
+just like Pipeline.__call__() does. The waveform is loaded once per audio
+file (in compute_speaker_centroids()/enroll_speaker(), not inside
+_embed_turns() itself) and reused for every turn across every speaker,
+which also avoids re-decoding the same file from disk on every single
+crop() call.
+
 See CODE_REVIEW.md, section 4, for the design this implements.
 """
 import json
@@ -23,6 +34,8 @@ import os
 from datetime import datetime, timezone
 
 import numpy as np
+
+from ..utils import load_waveform
 
 # pyannote/wespeaker-voxceleb-resnet34-LM is the embedding model pyannote's
 # own diarization pipelines use internally - same ecosystem, same
@@ -40,17 +53,37 @@ _MAX_TURNS_PER_SPEAKER = 5
 
 
 def _load_embedding_model(hf_token: str):
-    """Load the speaker-embedding model (lazy import, same pattern as diarize.py)."""
+    """
+    Load the speaker-embedding model (lazy import, same pattern as
+    diarize.py). Tries the current `token=` kwarg first, falling back to
+    the older `use_auth_token=` name - same huggingface_hub rename and
+    same compatibility fallback as Pipeline.from_pretrained() in
+    diarize.py (see CODE_REVIEW.md, section 9.7). Model.from_pretrained()
+    behaves differently from Pipeline.from_pretrained() on the version
+    found running this project live, though: it does NOT raise TypeError
+    for an unrecognized use_auth_token= kwarg, it silently swallows it
+    into **kwargs instead - so the token never actually reaches the
+    HuggingFace Hub download call. That showed up live as a harmless-
+    looking "sending unauthenticated requests to the HF Hub" warning
+    (still worked, since this particular model is not gated) rather than
+    a crash - see CODE_REVIEW.md, section 9.15.
+    """
     from pyannote.audio import Inference, Model
 
-    model = Model.from_pretrained(_EMBEDDING_MODEL_NAME, use_auth_token=hf_token)
+    try:
+        model = Model.from_pretrained(_EMBEDDING_MODEL_NAME, token=hf_token)
+    except TypeError:
+        model = Model.from_pretrained(_EMBEDDING_MODEL_NAME, use_auth_token=hf_token)
     return Inference(model, window="whole")
 
 
-def _embed_turns(inference, audio_path: str, turns: list, log):
+def _embed_turns(inference, audio, turns: list, log):
     """
     Compute one averaged embedding vector from a list of (start, end) turns
-    that all belong to the same voice. Returns None if nothing usable was found.
+    that all belong to the same voice. `audio` is a pre-loaded
+    {"waveform", "sample_rate"} dict (pipeline.utils.load_waveform()), not
+    a file path - see module docstring. Returns None if nothing usable was
+    found.
     """
     from pyannote.core import Segment
 
@@ -60,7 +93,7 @@ def _embed_turns(inference, audio_path: str, turns: list, log):
     vectors = []
     for start, end in candidates[:_MAX_TURNS_PER_SPEAKER]:
         try:
-            vector = inference.crop(audio_path, Segment(start, end))
+            vector = inference.crop(audio, Segment(start, end))
             vectors.append(np.asarray(vector).reshape(-1))
         except Exception as exc:
             log(f"  (skipped one turn while computing voice embedding: {exc})")
@@ -75,8 +108,9 @@ def compute_speaker_centroids(audio_path: str, turns: list, hf_token: str, log) 
     For each speaker label found by diarization, compute one representative
     embedding vector from that speaker's longest turns.
 
-    Returns {speaker_label: np.ndarray} - empty dict if there are no turns
-    or the embedding model cannot be loaded. Never raises.
+    Returns {speaker_label: np.ndarray} - empty dict if there are no turns,
+    the embedding model cannot be loaded, or the audio file cannot be
+    pre-loaded (see pipeline.utils.load_waveform()). Never raises.
     """
     if not turns:
         return {}
@@ -88,13 +122,19 @@ def compute_speaker_centroids(audio_path: str, turns: list, hf_token: str, log) 
         log(f"Speaker recognition skipped (could not load embedding model: {exc})")
         return {}
 
+    try:
+        audio = load_waveform(audio_path)
+    except Exception as exc:
+        log(f"Speaker recognition skipped (could not load audio for embedding: {exc})")
+        return {}
+
     turns_by_speaker: dict = {}
     for start, end, speaker in turns:
         turns_by_speaker.setdefault(speaker, []).append((start, end))
 
     centroids = {}
     for speaker, speaker_turns in turns_by_speaker.items():
-        vector = _embed_turns(inference, audio_path, speaker_turns, log)
+        vector = _embed_turns(inference, audio, speaker_turns, log)
         if vector is not None:
             centroids[speaker] = vector
 
@@ -198,7 +238,8 @@ def enroll_speaker(
     the more times someone is enrolled from a new recording.
     """
     inference = _load_embedding_model(hf_token)
-    new_vector = _embed_turns(inference, audio_path, turns, log)
+    audio = load_waveform(audio_path)
+    new_vector = _embed_turns(inference, audio, turns, log)
     if new_vector is None:
         raise RuntimeError(
             "Could not compute a voice embedding from the given audio - "

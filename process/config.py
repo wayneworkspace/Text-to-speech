@@ -14,8 +14,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-# Directory where markdown transcripts are written (<project root>/output/)
-OUTPUT_DIR = str(PROJECT_ROOT / "output")
+# Where run outputs are written, following the project's own ETL naming
+# (raw vs processed). Both live under <project root>/output/ (gitignored):
+#   - RAW_AUDIO_DIR: the audio extract_audio() pulls from each video
+#     (EXTRACT stage's own output - previously a temp file deleted after
+#     every run; now kept so a video never needs to be re-decoded from
+#     scratch just to re-run TRANSFORM/ENRICH on it).
+#   - PROCESSED_DIR: the final Markdown transcript (LOAD stage's output).
+RAW_AUDIO_DIR = str(PROJECT_ROOT / "output" / "raw")
+PROCESSED_DIR = str(PROJECT_ROOT / "output" / "processed")
 
 # Default location for the enrolled speaker-profile database (see
 # pipeline/speaker_id.py). Lives outside output/ because it is not a
@@ -98,6 +105,16 @@ CONFIG = {
     # to skip topic segmentation entirely.
     "anthropic_api_key": _get_optional_str("ANTHROPIC_API_KEY", None),
     "anthropic_model": _get_str("ANTHROPIC_MODEL", "claude-sonnet-5"),
+
+    # Max transcript lines sent to Claude in one transcript-correction call
+    # (see pipeline/enrich/correct.py). Real bug hit running this project on
+    # a ~2 hour video (~1500 lines, see CODE_REVIEW.md): one giant call used
+    # its entire output budget on extended thinking and returned no answer
+    # at all (JSON parse failed on an empty response) - correction silently
+    # never applied. Batching keeps each call's input/thinking/output small
+    # and predictable no matter how long the video is, the same way
+    # EXTRACT_CHUNK_SECONDS already does for audio extraction.
+    "correction_batch_size": _get_int("CORRECTION_BATCH_SIZE", 150),
 
     # Where the enrolled speaker-voice database lives (see pipeline/speaker_id.py).
     # Not tracked by git (see .gitignore) - it is local biometric-adjacent data.

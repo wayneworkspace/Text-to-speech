@@ -21,7 +21,7 @@ Source → Ingestion → Processing → Storage
 - **Source** — the user selects an `.mp4` video through a Tkinter file dialog (`pipeline/gui.py`), or `process/batch.py` scans `INPUT_DIR` recursively for video files.
 - **Ingestion** — FFmpeg/ffprobe read the video's metadata and extract a mono 16kHz WAV audio track, splitting long videos into parallel chunks for speed (`pipeline/extract/`).
 - **Processing** — the audio is split into chunks at silence boundaries and transcribed chunk-by-chunk with Whisper, using an optional domain-vocabulary hint and exposing a confidence flag per segment; timestamps are re-aligned to match the original video (`pipeline/transform/`). Four steps here are optional and run only if their credentials are set: LLM-based transcript correction, speaker diarization, speaker recognition, and topic segmentation - the last two via the Claude API (all under `pipeline/enrich/`).
-- **Storage** — the final transcript is written as a Markdown file under `output/`, one file per run (`pipeline/load/`).
+- **Storage** — the raw audio EXTRACT pulled from the video is kept under `output/raw/` (one `.wav` per video, overwritten on a re-run of the same video), and the final transcript is written as a Markdown file under `output/processed/`, one file per run (`pipeline/load/`).
 
 There is no "Serving" layer: this is a local tool, not a service — the output is a static file the user opens directly.
 
@@ -39,7 +39,9 @@ project/
 ├── .gitignore
 ├── data/
 │   └── speaker_profiles.json   # enrolled speaker voice database (not tracked by git)
-├── output/                     # written transcripts (main.py and batch.py both write here)
+├── output/                     # main.py and batch.py both write here
+│   ├── raw/                     # extracted audio per video (<video_name>.wav, overwritten each re-run)
+│   └── processed/                # written transcripts ([dd-mm-yy] - <video_name> - transcript.md)
 ├── state/                      # batch.py's progress table + lock file (not tracked by git)
 ├── logs/                       # batch.py's per-run and per-video logs (not tracked by git)
 └── process/
@@ -85,7 +87,7 @@ pip install -r requirements.txt
 python process/main.py
 ```
 
-A small window opens — click **"Choose MP4 video..."**, pick a file, and the pipeline runs automatically with a live progress log. The transcript is written to `output/[dd-mm-yy] - <video_name> - transcript.md` (date = the day the pipeline ran).
+A small window opens — click **"Choose MP4 video..."**, pick a file, and the pipeline runs automatically with a live progress log. The transcript is written to `output/processed/[dd-mm-yy] - <video_name> - transcript.md` (date = the day the pipeline ran), and the raw audio FFmpeg extracted along the way is kept at `output/raw/<video_name>.wav` - reused output rather than a deleted temp file, since it is the same audio regardless of when you (re-)run the pipeline.
 
 You can also pass a file path directly to skip the dialog:
 ```
@@ -111,6 +113,7 @@ All tunable settings live in a `.env` file at the project root, loaded by `proce
 | `HUGGINGFACE_TOKEN` | Optional. Enables speaker diarization (who said what) via pyannote.audio. Leave empty to skip diarization entirely — see "Getting a HuggingFace token" below. |
 | `ANTHROPIC_API_KEY` | Optional. Enables two independent Claude API steps: transcript correction (fixes likely mis-transcribed words using context) and topic segmentation. Leave empty to skip both — see "Getting an Anthropic API key" below. |
 | `ANTHROPIC_MODEL` | Which Claude model to use for transcript correction and topic segmentation (default: `claude-sonnet-5`). |
+| `CORRECTION_BATCH_SIZE` | Max transcript lines sent to Claude per transcript-correction call (default `150`). Correction runs in batches of this size rather than one call for the whole video — a real failure on a ~2 hour video showed one call for ~1500 lines can silently fail (the model's own reasoning can use the entire response budget, leaving nothing for the answer). Lower this if correction still fails on an unusually long or dense video. |
 | `SPEAKER_PROFILES_PATH` | Optional. Where the enrolled speaker-voice database lives. Leave empty to use the default (`data/speaker_profiles.json`). |
 | `SPEAKER_MATCH_THRESHOLD` | Cosine-similarity threshold (0-1) above which a voice is considered a match for an enrolled speaker (default `0.75`). Higher = stricter matching, more voices fall back to `Speaker 1`, `Speaker 2`... |
 | `AUTO_UPDATE_SPEAKER_PROFILES` | `true` / `false` - if `true`, a confident match also refines that speaker's stored profile with the new sample. Leave `false` until you trust the matches you are getting (default `false`). |
@@ -161,7 +164,7 @@ The same `ANTHROPIC_API_KEY` unlocks two independent, optional steps, each makin
 3. Create a key at [platform.claude.com/settings/keys](https://platform.claude.com/settings/keys).
 4. Paste it into `.env` as `ANTHROPIC_API_KEY=sk-ant-...`.
 
-**Transcript correction** (`pipeline/enrich/correct.py`) runs right after Whisper, before anything else reads the text. It sends Claude the full transcript once — plus the video's filename and `DOMAIN_VOCABULARY`, if set, as context — and asks it to flag only the lines it's fairly confident were mis-transcribed (typically a proper noun, a foreign/technical term spoken mid-sentence, or domain jargon Whisper doesn't know) and return corrected text for just those. It is explicitly told not to rephrase, summarize, translate, or otherwise change meaning, and it returns an empty list on the common case where nothing looks wrong - so cost stays low and roughly constant regardless of transcript length, rather than growing with segment count. As with every other optional step here, a bad key, no network, or a malformed response never breaks the pipeline: it logs a notice and the transcript goes through unchanged.
+**Transcript correction** (`pipeline/enrich/correct.py`) runs right after Whisper, before anything else reads the text. It sends Claude the transcript in batches of `CORRECTION_BATCH_SIZE` lines (not one call for the whole video — see that setting above for why) — each batch plus the video's filename and `DOMAIN_VOCABULARY`, if set, as context — and asks it to flag only the lines it's fairly confident were mis-transcribed (typically a proper noun, a foreign/technical term spoken mid-sentence, or domain jargon Whisper doesn't know) and return corrected text for just those. It is explicitly told not to rephrase, summarize, translate, or otherwise change meaning, and a batch returns an empty list on the common case where nothing in it looks wrong - so output cost per batch stays low regardless of how much of it needed fixing. As with every other optional step here, a bad key, no network, or a malformed response never breaks the pipeline - and now that correction runs in batches, a problem with one batch only costs that batch's lines: it logs a notice and those lines go through unchanged while every other batch's corrections still apply normally.
 
 **Topic segmentation** (`pipeline/enrich/enrich.py`) reads the (corrected) transcript once and returns a list of topic headings inserted into the Markdown output.
 
@@ -175,7 +178,7 @@ If `ANTHROPIC_API_KEY` is left empty, `main.py` logs a notice and skips both ste
 python process/batch.py
 ```
 
-Set `INPUT_DIR` in `.env` first — `batch.py` scans it recursively for `.mp4`/`.mov`/`.mkv`/`.avi`/`.webm` files and processes each one through the same `run_pipeline()` as `main.py`, writing to `output/` the same way. What it adds on top (all in `pipeline/batch_state.py`):
+Set `INPUT_DIR` in `.env` first — `batch.py` scans it recursively for `.mp4`/`.mov`/`.mkv`/`.avi`/`.webm` files and processes each one through the same `run_pipeline()` as `main.py`, writing to `output/raw/` and `output/processed/` the same way. What it adds on top (all in `pipeline/batch_state.py`):
 
 - **Never processes the same video twice** — a `state/batch_state.json` table tracks each video as `pending` / `running` / `done` / `failed`, so re-running `batch.py` (e.g. the next scheduled trigger) only picks up new or unfinished videos.
 - **Safe to trigger on a schedule that might overlap itself** — a lock file (`state/.batch.lock`) stops two `batch.py` runs from processing videos at the same time and fighting over the GPU. If a previous run crashed and left the lock behind, the next run detects this (the lock's PID is no longer alive, or it is simply older than any single video could plausibly take) and clears it automatically, logging that it did so.
@@ -258,7 +261,7 @@ sudo apt install python3-tk
 - Since audio is split into chunks, a word or two can occasionally be lost right at a chunk boundary if no good nearby silence was found. The chunk planner always prefers cutting at the closest detected silence to minimize this. The same class of boundary imprecision (tens of milliseconds, not full words) applies to the parallel audio-extraction chunking described in "Faster audio extraction" above, for the same reason (fast `-ss`-before-`-i` seeking).
 - Transcription accuracy depends on source audio quality (background noise, overlapping speakers, accents, domain-specific terms...). `DOMAIN_VOCABULARY`, the ⚠️ confidence flag, and the optional transcript-correction step all help, but don't eliminate this - correction only catches errors the LLM can infer from context (a name, a term it recognizes as out of place), not systematic mis-hearings it has no way to detect from text alone.
 - Processing can take longer than the video's actual runtime on CPU-only machines.
-- Running the pipeline twice on the same day for the same video **overwrites** the previous transcript (same filename `[dd-mm-yy] - <video_name> - transcript.md`), whether run through `main.py` or `batch.py`.
+- Running the pipeline twice on the same day for the same video **overwrites** the previous transcript in `output/processed/` (same filename `[dd-mm-yy] - <video_name> - transcript.md`), whether run through `main.py` or `batch.py`. The raw audio in `output/raw/<video_name>.wav` is overwritten on *every* re-run regardless of date - it is not versioned, since it is always the same bytes for the same video.
 - Speaker labels (`SPEAKER_00`, `SPEAKER_01`, ...) from diarization alone are anonymous — pyannote only tells voices apart, it has no idea of real names. Two speakers with very similar-sounding voices can occasionally get merged into one label or split inconsistently. Enrolling people via `pipeline/enrich/speaker_id.py` (see "Speaker recognition across videos" above) resolves known voices to real names, but matching is similarity-based, not exact — an unusually noisy recording or a wrongly-tuned `SPEAKER_MATCH_THRESHOLD` can still produce a wrong match or a missed one.
 - Transcript correction and topic segmentation are both generated by an LLM reading the transcript once - reasonable approximations, not guaranteed-correct, and each run costs a small amount of Claude API usage.
 - Transcript correction, speaker diarization, and topic segmentation are all skipped gracefully (with a log message, not an error) if their respective credentials aren't set in `.env`.
