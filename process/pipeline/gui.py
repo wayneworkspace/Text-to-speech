@@ -4,13 +4,12 @@ This module contains NO pipeline logic - it receives a `run_pipeline` callback
 from the outside (dependency injection), keeping the UI fully decoupled from processing.
 """
 import os
-import sys
 import queue
-import threading
 import subprocess
-import traceback
-
+import sys
+import threading
 import tkinter as tk
+import traceback
 from tkinter import filedialog, messagebox, ttk
 
 

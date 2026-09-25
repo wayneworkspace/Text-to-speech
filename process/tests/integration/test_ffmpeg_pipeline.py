@@ -21,9 +21,9 @@ import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from pipeline.utils import FFMPEG_BIN, FFPROBE_BIN, check_ffmpeg_available
 from pipeline.extract import extract as extract_module
 from pipeline.transform import transform as transform_module
+from pipeline.utils import FFMPEG_BIN, FFPROBE_BIN, check_ffmpeg_available
 
 try:
     check_ffmpeg_available()

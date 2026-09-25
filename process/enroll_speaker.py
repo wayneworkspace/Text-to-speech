@@ -31,10 +31,10 @@ import sys
 import tempfile
 
 from config import CONFIG
-from pipeline.utils import check_ffmpeg_available
-from pipeline.extract.extract import probe_media_info, extract_audio
 from pipeline.enrich.diarize import diarize_audio
 from pipeline.enrich.speaker_id import enroll_speaker
+from pipeline.extract.extract import extract_audio, probe_media_info
+from pipeline.utils import check_ffmpeg_available
 
 
 def _log(message: str) -> None:

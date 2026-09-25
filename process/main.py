@@ -12,24 +12,24 @@ Usage:
     python main.py "path/to/video.mp4"
 """
 import os
-import sys
 import shutil
+import sys
 import tempfile
 
-from config import CONFIG, RAW_AUDIO_DIR, PROCESSED_DIR
-from pipeline.utils import check_ffmpeg_available
-from pipeline.extract.extract import probe_media_info, extract_audio
-from pipeline.transform.transform import load_whisper_model, transform_to_segments
-from pipeline.enrich.diarize import diarize_audio, assign_speakers
+from config import CONFIG, PROCESSED_DIR, RAW_AUDIO_DIR
+from pipeline.enrich.correct import correct_transcript_errors
+from pipeline.enrich.diarize import assign_speakers, diarize_audio
+from pipeline.enrich.enrich import segment_topics
 from pipeline.enrich.speaker_id import (
     compute_speaker_centroids,
     load_profiles,
     match_speakers,
     resolve_speaker_names,
 )
-from pipeline.enrich.correct import correct_transcript_errors
-from pipeline.enrich.enrich import segment_topics
+from pipeline.extract.extract import extract_audio, probe_media_info
 from pipeline.load.load import write_markdown
+from pipeline.transform.transform import load_whisper_model, transform_to_segments
+from pipeline.utils import check_ffmpeg_available
 
 
 def run_pipeline(video_path: str, log) -> str:
@@ -147,6 +147,7 @@ def main():
     # change for normal `python main.py` usage.
     import tkinter as tk
     from tkinter import messagebox
+
     from pipeline.gui import App
 
     initial_path = sys.argv[1] if len(sys.argv) > 1 else None

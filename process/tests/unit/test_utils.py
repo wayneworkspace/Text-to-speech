@@ -20,7 +20,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from pipeline.utils import extract_text_from_anthropic_response, load_waveform, log_anthropic_usage
+from pipeline.utils import (
+    extract_text_from_anthropic_response,
+    load_waveform,
+    log_anthropic_usage,
+)
 
 
 def _fake_torch_module():
